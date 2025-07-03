@@ -1,10 +1,11 @@
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 import requests
 import argparse
 import sys
 from tqdm import tqdm
 import os
 import re
+import mimetypes
 
 def get_video_url(page_content: str, verbose: bool) -> tuple[str, str]:
     """Extracts the video playback URL and title from the page content."""
@@ -25,11 +26,39 @@ def get_video_url(page_content: str, verbose: bool) -> tuple[str, str]:
         print(f"[INFO] Video Title: {title}")
     return video, title
 
+def get_file_extension(url: str, content_type: str = None) -> str:
+    """Determines the file extension based on URL and content-type."""
+    # First try to get extension from the URL
+    path = urlparse(url).path
+    ext = os.path.splitext(path)[1]
+    if ext:
+        return ext
+
+    # If no extension in URL, try to get it from content-type
+    if content_type:
+        ext = mimetypes.guess_extension(content_type)
+        if ext:
+            return ext
+
+    # Default to .mp4 if we can't determine the extension
+    return '.mp4'
+
 def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbose: bool) -> None:
     """Downloads the file from the given URL with provided cookies, supports resuming."""
     headers = {}
-    file_mode = 'wb'
+    
+    # Get response headers first to check content type
+    head_response = requests.head(url, cookies=cookies)
+    content_type = head_response.headers.get('content-type')
+    
+    # Add file extension if not present
+    if not os.path.splitext(filename)[1]:
+        extension = get_file_extension(url, content_type)
+        filename = filename + extension
+        if verbose:
+            print(f"[INFO] Adding file extension: {extension}")
 
+    file_mode = 'wb'
     downloaded_size = 0
     if os.path.exists(filename):
         downloaded_size = os.path.getsize(filename)
