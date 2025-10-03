@@ -5,6 +5,7 @@ import sys
 from tqdm import tqdm
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def extract_video_id(link_or_id: str) -> str:
     """Extract video ID whether input is a full Google Drive link or just an ID."""
@@ -48,7 +49,7 @@ def get_video_url(page_content: str, verbose: bool) -> tuple[str, str]:
     return video, title
 
 def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbose: bool) -> None:
-    """Downloads the file from the given URL with provided cookies, supports resuming."""
+    """Single-threaded download with resume support."""
     headers = {}
     file_mode = 'wb'
 
@@ -64,7 +65,7 @@ def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbo
             print(f"[INFO] Resuming download from byte {downloaded_size}")
 
     response = requests.get(url, stream=True, cookies=cookies, headers=headers)
-    if response.status_code in (200, 206):  # 200 for new downloads, 206 for partial content
+    if response.status_code in (200, 206):
         total_size = int(response.headers.get('content-length', 0)) + downloaded_size
         with open(filename, file_mode) as file:
             with tqdm(total=total_size, initial=downloaded_size, unit='B', unit_scale=True, desc=filename, file=sys.stdout) as pbar:
@@ -76,26 +77,68 @@ def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbo
     else:
         print(f"Error downloading {filename}, status code: {response.status_code}")
 
+def fetch_range(url: str, cookies: dict, start: int, end: int, part_file: str, verbose: bool) -> None:
+    """Download a specific byte range into a part file."""
+    headers = {"Range": f"bytes={start}-{end}"}
+    if verbose:
+        print(f"[INFO] Downloading range {start}-{end}")
+    response = requests.get(url, stream=True, headers=headers, cookies=cookies)
+    if response.status_code in (200, 206):
+        with open(part_file, "wb") as f:
+            for chunk in response.iter_content(1024 * 256):  # 256KB buffer
+                if chunk:
+                    f.write(chunk)
+    else:
+        raise Exception(f"Failed to download range {start}-{end}, status {response.status_code}")
+
+def parallel_download_file(url: str, cookies: dict, filename: str, num_threads: int, verbose: bool) -> None:
+    """Download a file in parallel using multiple threads and range requests."""
+    # First get file size
+    head = requests.head(url, cookies=cookies)
+    if "content-length" not in head.headers:
+        print("[WARN] Could not determine file size, falling back to single-thread download.")
+        return download_file(url, cookies, filename, 1024*256, verbose)
+
+    total_size = int(head.headers["content-length"])
+    part_size = total_size // num_threads
+    futures = []
+    part_files = []
+
+    if verbose:
+        print(f"[INFO] Total size: {total_size} bytes")
+        print(f"[INFO] Splitting into {num_threads} parts of ~{part_size} bytes each")
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        for i in range(num_threads):
+            start = i * part_size
+            end = (start + part_size - 1) if i < num_threads - 1 else total_size - 1
+            part_file = f"{filename}.part{i}"
+            part_files.append(part_file)
+            futures.append(executor.submit(fetch_range, url, cookies, start, end, part_file, verbose))
+
+        for future in as_completed(futures):
+            future.result()  # raises exception if any failed
+
+    # Merge parts
+    with open(filename, "wb") as outfile:
+        for part_file in part_files:
+            with open(part_file, "rb") as pf:
+                outfile.write(pf.read())
+            os.remove(part_file)
+
+    print(f"\n{filename} downloaded successfully with {num_threads} threads.")
+
 def sanitize_filename(filename: str) -> str:
     """Sanitizes the filename by removing invalid characters and normalizing."""
-    # Replace '+' with spaces
-    filename = filename.replace('+', ' ')
-    
-    # Remove invalid characters for Windows and Unix systems
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-    
-    # Remove control characters
-    filename = "".join(char for char in filename if ord(char) >= 32)
-    
+    filename = filename.replace('+', ' ')  # Replace '+' with spaces
+    filename = re.sub(r'[<>:"/\\|?*]', '', filename)  # Remove invalid characters
+    filename = "".join(char for char in filename if ord(char) >= 32)  # Remove control chars
     filename = filename.strip()
-    
-    # Ensure file has an extension (default to .mp4)
     if not os.path.splitext(filename)[1]:
         filename += ".mp4"
-    
     return filename
 
-def main(video_input: str, output_file: str = None, chunk_size: int = 1024, verbose: bool = False) -> None:
+def main(video_input: str, output_file: str = None, chunk_size: int = 1024, verbose: bool = False, threads: int = 1) -> None:
     """Main function to process video input (link or ID) and download the video file."""
     video_id = extract_video_id(video_input)
     drive_url = f'https://drive.google.com/u/0/get_video_info?docid={video_id}&drive_originator_app=303'
@@ -116,7 +159,10 @@ def main(video_input: str, output_file: str = None, chunk_size: int = 1024, verb
         print(f"[INFO] Filename sanitized to: {filename}")
 
     if video:
-        download_file(video, cookies, filename, chunk_size, verbose)
+        if threads > 1:
+            parallel_download_file(video, cookies, filename, threads, verbose)
+        else:
+            download_file(video, cookies, filename, chunk_size, verbose)
     else:
         print("Unable to retrieve the video URL. Ensure the video link/ID is correct and accessible.")
 
@@ -124,9 +170,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Script to download videos from Google Drive.")
     parser.add_argument("video_input", type=str, help="The Google Drive video link or video ID.")
     parser.add_argument("-o", "--output", type=str, help="Optional output file name for the downloaded video (default: video name in gdrive).")
-    parser.add_argument("-c", "--chunk_size", type=int, default=1024, help="Optional chunk size (in bytes) for downloading the video. Default is 1024 bytes.")
+    parser.add_argument("-c", "--chunk_size", type=int, default=1024, help="Optional chunk size (in bytes) for single-thread download. Default is 1024 bytes.")
+    parser.add_argument("-t", "--threads", type=int, default=1, help="Number of parallel threads for faster download (default=1).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
-    parser.add_argument("--version", action="version", version="%(prog)s 1.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.0")
 
     args = parser.parse_args()
-    main(args.video_input, args.output, args.chunk_size, args.verbose)
+    main(args.video_input, args.output, args.chunk_size, args.verbose, args.threads)
