@@ -1,10 +1,32 @@
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse, parse_qs
 import requests
 import argparse
 import sys
 from tqdm import tqdm
 import os
 import re
+
+def extract_video_id(link_or_id: str) -> str:
+    """Extract video ID whether input is a full Google Drive link or just an ID."""
+    # Case 1: Already looks like an ID
+    if re.match(r'^[\w-]{20,}$', link_or_id):  # Drive IDs are usually long (25+ chars)
+        return link_or_id
+    
+    # Case 2: It's a link, try to parse
+    parsed = urlparse(link_or_id)
+    query = parse_qs(parsed.query)
+
+    # Link format: https://drive.google.com/file/d/<ID>/view
+    match = re.search(r'/d/([\w-]+)', parsed.path)
+    if match:
+        return match.group(1)
+
+    # Link format: https://drive.google.com/open?id=<ID>
+    if "id" in query:
+        return query["id"][0]
+
+    # Fallback: return input
+    return link_or_id
 
 def get_video_url(page_content: str, verbose: bool) -> tuple[str, str]:
     """Extracts the video playback URL and title from the page content."""
@@ -55,15 +77,27 @@ def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbo
         print(f"Error downloading {filename}, status code: {response.status_code}")
 
 def sanitize_filename(filename: str) -> str:
-    """Sanitizes the filename by removing invalid characters."""
+    """Sanitizes the filename by removing invalid characters and normalizing."""
+    # Replace '+' with spaces
+    filename = filename.replace('+', ' ')
+    
     # Remove invalid characters for Windows and Unix systems
     filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+    
     # Remove control characters
     filename = "".join(char for char in filename if ord(char) >= 32)
-    return filename.strip()
+    
+    filename = filename.strip()
+    
+    # Ensure file has an extension (default to .mp4)
+    if not os.path.splitext(filename)[1]:
+        filename += ".mp4"
+    
+    return filename
 
-def main(video_id: str, output_file: str = None, chunk_size: int = 1024, verbose: bool = False) -> None:
-    """Main function to process video ID and download the video file."""
+def main(video_input: str, output_file: str = None, chunk_size: int = 1024, verbose: bool = False) -> None:
+    """Main function to process video input (link or ID) and download the video file."""
+    video_id = extract_video_id(video_input)
     drive_url = f'https://drive.google.com/u/0/get_video_info?docid={video_id}&drive_originator_app=303'
     
     if verbose:
@@ -84,15 +118,15 @@ def main(video_id: str, output_file: str = None, chunk_size: int = 1024, verbose
     if video:
         download_file(video, cookies, filename, chunk_size, verbose)
     else:
-        print("Unable to retrieve the video URL. Ensure the video ID is correct and accessible.")
+        print("Unable to retrieve the video URL. Ensure the video link/ID is correct and accessible.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Script to download videos from Google Drive.")
-    parser.add_argument("video_id", type=str, help="The video ID from Google Drive (e.g., 'abc-Qt12kjmS21kjDm2kjd').")
+    parser.add_argument("video_input", type=str, help="The Google Drive video link or video ID.")
     parser.add_argument("-o", "--output", type=str, help="Optional output file name for the downloaded video (default: video name in gdrive).")
     parser.add_argument("-c", "--chunk_size", type=int, default=1024, help="Optional chunk size (in bytes) for downloading the video. Default is 1024 bytes.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
     parser.add_argument("--version", action="version", version="%(prog)s 1.0")
 
     args = parser.parse_args()
-    main(args.video_id, args.output, args.chunk_size, args.verbose)
+    main(args.video_input, args.output, args.chunk_size, args.verbose)
